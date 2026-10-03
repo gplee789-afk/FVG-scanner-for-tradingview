@@ -5,7 +5,11 @@
 - **策略**：訊號直接下單，用 TradingView 的「策略測試器」看績效。
 - **掃描器**：一次掃 40 檔，結果排成表格，一個警報涵蓋全部。
 
-只用原指標本身的東西，不接 LuxAlgo OB。要掃 Order Block，請用 [SMC OB 掃描器](https://github.com/gplee789-afk/SMC-ob-scanner-for-tradingview-v2)；掃描器的代號清單也可以用那邊的[名單工具](https://gplee789-afk.github.io/SMC-ob-scanner-for-tradingview-v2/)產生。
+只用原指標本身的東西，不接 LuxAlgo OB。要掃 Order Block，請用 [SMC OB 掃描器](https://github.com/gplee789-afk/SMC-ob-scanner-for-tradingview-v2)。
+
+**名單工具（網頁版）：https://gplee789-afk.github.io/FVG-scanner-for-tradingview/**
+
+依成交金額等項目排出前 400 檔，每 40 檔一批，複製後直接貼進掃描器的代號清單。用法見 [SMC OB 掃描器的說明](https://github.com/gplee789-afk/SMC-ob-scanner-for-tradingview-v2#名單工具說明)。
 
 ---
 
@@ -13,6 +17,7 @@
 
 | 檔案 | 用途 |
 | --- | --- |
+| `index.html` | 名單工具（網頁版本體，由 GitHub Pages 發布）：排出前 400 檔，每 40 檔一批。每日資料讀自 SMC OB 掃描器的 repo，由那邊的 GitHub Actions 每個交易日更新 |
 | `fvg_prob_strategy.pine` | 策略：FVG、分數、IFVG、內部 OB、掃蕩、訊號引擎，訊號直接下單 |
 | `fvg_screener.pine` | 多商品掃描器：用策略的判斷邏輯一次掃 40 檔，結果排成表格 |
 
@@ -61,7 +66,7 @@
 ### 怎麼用
 
 1. 新建指標，貼上 `fvg_screener.pine`，加到圖表（會出現在下方獨立窗格）。
-2. 設定「② 代號清單」貼上 40 行代號，格式是 `交易所:代號`，例如 `TWSE:2330`、`TPEX:6488`。
+2. 設定「② 代號清單」貼上 40 行代號（用[名單工具](https://gplee789-afk.github.io/FVG-scanner-for-tradingview/)產生），格式是 `交易所:代號`，例如 `TWSE:2330`、`TPEX:6488`。
 3. 圖表週期必須小於或等於「掃描週期」（預設 30 分）。
 
 ### 看表格
