@@ -1,0 +1,576 @@
+//@version=6
+// ══════════════════════════════════════════════════════════════════════
+//  FVG with Probabilities（台股策略版）
+//
+//  以 GainzAlgo "FVG with Probabilities"（台股改版）的邏輯為主，程式碼重寫成 strategy()，
+//  訊號直接下單，用 TradingView 的「策略測試器」看績效。只用原指標本身的東西，不接 LuxAlgo OB。
+//
+//  跟原版的差異：
+//   1. FVG 失效判定的選項確實生效（原版 Full Rebalance Mitigation 沒作用）
+//   2. 早盤 / 中盤 / 尾盤可以個別勾選；原版三段加起來等於整個盤中，時段條件沒作用
+//   3. 開收盤過濾只在日內週期生效；原版在日線會把訊號全部擋掉
+//   4. 內部 OB 會失效、成立當根不算回測；原版的 OB 永遠不會消失
+//   5. 訊號只在 K 棒收盤後成立，不會盤中閃爍
+//   6. 分級只算有開啟的觸發
+//   7. 拿掉跟訊號無關的圖層（等高低線、開盤區間、昨日高低、溢價折價區），圖比較乾淨
+//  分數是寫死權重的評分，不是機率。
+// ══════════════════════════════════════════════════════════════════════
+strategy("FVG Prob TW Strategy", "FVG 策略", overlay = true, max_bars_back = 500,
+     max_boxes_count = 300, max_lines_count = 300, max_labels_count = 500,
+     initial_capital = 1000000, default_qty_type = strategy.percent_of_equity, default_qty_value = 100,
+     commission_type = strategy.commission.percent, commission_value = 0.2, slippage = 0,
+     pyramiding = 0, process_orders_on_close = false)
+
+TZ = "Asia/Taipei"
+
+G_TRD  = "① 交易"
+G_FVG  = "② FVG"
+G_DISP = "③ 位移 K 棒"
+G_IFVG = "④ IFVG（反轉缺口）"
+G_SC   = "⑤ 分數"
+G_STR  = "⑥ 結構"
+G_TRG  = "⑦ OB 回測與掃蕩（內部）"
+G_SESS = "⑧ 台股時段"
+G_SIG  = "⑨ 訊號"
+G_VOL  = "⑩ 量能與波動"
+G_DRAW = "⑪ 顯示"
+
+// ═══════════════ ① 交易 ═══════════════
+i_dir      = input.string("兩者", "交易方向", options = ["兩者", "只做多", "只做空"], display = display.none, group = G_TRD,
+     tooltip = "成本在策略的「屬性」裡設定，預設每邊 0.2%（來回約 0.4%，含證交稅）。")
+i_slMode   = input.string("前 N 根極值", "停損方式", options = ["前 N 根極值", "ATR"], display = display.none, group = G_TRD,
+     tooltip = "前 N 根極值：多單停在最近 N 根（含觸發那根與確認 K）最低點下方。\nATR：進場價往下 k 倍 ATR。")
+i_slBars   = input.int(3, "N（根）", minval = 1, maxval = 20, display = display.none, group = G_TRD)
+i_slBuf    = input.float(0.1, "極值外緩衝 (ATR 倍)", minval = 0.0, step = 0.05, display = display.none, group = G_TRD)
+i_slAtr    = input.float(1.5, "ATR 停損 k", minval = 0.1, step = 0.1, display = display.none, group = G_TRD)
+i_rr       = input.float(2.0, "目標 (R 倍)", minval = 0.5, step = 0.5, display = display.none, group = G_TRD)
+i_maxBars  = input.int(50, "最多持有幾根（0 = 不限）", minval = 0, display = display.none, group = G_TRD)
+i_flatEOD  = input.bool(false, "日內週期收盤前平倉", display = display.none, group = G_TRD,
+     tooltip = "在當天最後一根 K 棒收盤時平倉，不留倉過夜（避開隔夜跳空）。只在日內週期生效。")
+
+// ═══════════════ ② FVG ═══════════════
+i_atrLen     = input.int(14, "ATR 長度", minval = 1, display = display.none, group = G_FVG)
+i_minAtrMult = input.float(0.3, "最小缺口 (ATR 倍)", minval = 0.05, step = 0.05, display = display.none, group = G_FVG)
+i_fvgMitig   = input.string("影線回補", "失效判定", options = ["影線回補", "收盤穿越"], display = display.none, group = G_FVG,
+     tooltip = "影線回補：影線碰到缺口另一端就移除。收盤穿越：收盤越過另一端才移除。兩者都會先檢查能不能轉成 IFVG。")
+i_showCE     = input.bool(true, "顯示 CE (50%) 線", display = display.none, group = G_FVG)
+
+// ═══════════════ ③ 位移 K 棒 ═══════════════
+i_useDisp     = input.bool(true, "FVG 中間那根需為位移 K 棒", display = display.none, group = G_DISP)
+i_dispBodyAtr = input.float(0.6, "最小實體 (ATR 倍)", minval = 0.1, step = 0.05, display = display.none, group = G_DISP)
+i_dispBodyRat = input.float(0.6, "最小實體 / 全長", minval = 0.3, maxval = 0.95, step = 0.05, display = display.none, group = G_DISP)
+
+// ═══════════════ ④ IFVG ═══════════════
+i_trackIFVG  = input.bool(true, "追蹤 IFVG", display = display.none, group = G_IFVG)
+i_ifvgDisp   = input.bool(true, "反轉 K 需為反向位移 K 棒", display = display.none, group = G_IFVG)
+i_ifvgDist   = input.float(0.3, "收盤需越過缺口 (ATR 倍)", minval = 0.0, step = 0.05, display = display.none, group = G_IFVG)
+i_ifvgStruct = input.bool(true, "需 HH / LL 結構方向一致", display = display.none, group = G_IFVG)
+i_ifvgRedraw = input.bool(true, "方框改畫成反轉 K 實體", display = display.none, group = G_IFVG)
+i_ifvgKzOnly = input.bool(false, "只在啟用時段內反轉", display = display.none, group = G_IFVG)
+
+// ═══════════════ ⑤ 分數 ═══════════════
+i_emaFast  = input.int(20,  "快 EMA", display = display.none, group = G_SC)
+i_emaSlow  = input.int(50,  "慢 EMA", display = display.none, group = G_SC)
+i_emaHTF   = input.int(200, "長 EMA", display = display.none, group = G_SC)
+i_showEMA  = input.bool(true, "顯示 EMA", display = display.none, group = G_SC)
+i_highProb = input.float(0.65, "高分門檻 (H)", minval = 0.5, maxval = 0.99, step = 0.01, display = display.none, group = G_SC)
+i_medProb  = input.float(0.45, "中分門檻 (M)", minval = 0.2, maxval = 0.64, step = 0.01, display = display.none, group = G_SC)
+i_maxScore = input.float(0.85, "分數上限", minval = 0.70, maxval = 0.98, step = 0.01, display = display.none, group = G_SC)
+
+// ═══════════════ ⑥ 結構 ═══════════════
+i_swingLen   = input.int(5, "Pivot 左右根數", minval = 2, maxval = 20, display = display.none, group = G_STR)
+i_showSwings = input.bool(false, "標出 swing 點", display = display.none, group = G_STR)
+
+// ═══════════════ ⑦ OB 回測與掃蕩（內部，不畫出來）═══════════════
+i_useOB        = input.bool(true, "偵測 OB", display = display.none, group = G_TRG,
+     tooltip = "出現位移 K 棒時，往前找最近一根反向 K 當作 OB，只拿來當訊號觸發，不畫在圖上。")
+i_obLookback   = input.int(10, "往前找反向 K (根)", minval = 3, maxval = 30, display = display.none, group = G_TRG)
+i_obMaxAge     = input.int(100, "OB 最長保留 (根)", minval = 10, display = display.none, group = G_TRG)
+i_useSweeps    = input.bool(true, "偵測流動性掃蕩", display = display.none, group = G_TRG)
+i_sweepMinWick = input.float(0.3, "最小刺穿 (ATR 倍)", minval = 0.1, step = 0.05, display = display.none, group = G_TRG)
+i_sweepReclaim = input.bool(true, "需收回 swing 點內", display = display.none, group = G_TRG)
+
+// ═══════════════ ⑧ 台股時段 ═══════════════
+i_sessOpen   = input.session("0900-1030", "早盤", display = display.none, group = G_SESS)
+i_sessMid    = input.session("1030-1230", "中盤", display = display.none, group = G_SESS)
+i_sessClose  = input.session("1230-1330", "尾盤", display = display.none, group = G_SESS)
+i_useOpen    = input.bool(true, "早盤", inline = "kz", display = display.none, group = G_SESS)
+i_useMid     = input.bool(true, "中盤", inline = "kz", display = display.none, group = G_SESS)
+i_useClose   = input.bool(true, "尾盤", inline = "kz", display = display.none, group = G_SESS,
+     tooltip = "勾選的時段算「啟用時段」，用在分數、訊號的時段條件和 IFVG。三個全勾等於整個盤中，跟原版相同。")
+i_useTimeF   = input.bool(true, "啟用開收盤過濾", display = display.none, group = G_SESS,
+     tooltip = "只在日內週期生效，以 K 棒的開始時間判斷。")
+i_avoidOpen  = input.int(5,  "開盤後 N 分鐘不出訊號", minval = 0, maxval = 30, display = display.none, group = G_SESS)
+i_avoidClose = input.int(15, "收盤前 N 分鐘不出訊號", minval = 0, maxval = 30, display = display.none, group = G_SESS)
+i_avoidLunch = input.bool(true, "11:30–12:30 不出訊號", display = display.none, group = G_SESS)
+
+// ═══════════════ ⑨ 訊號 ═══════════════
+i_sigMode     = input.string("兩者", "訊號種類", options = ["順勢", "反轉", "兩者"], display = display.none, group = G_SIG)
+i_sigMinScore = input.float(0.60, "CE 觸發的最低 FVG 分數", minval = 0.40, maxval = 0.95, step = 0.01, display = display.none, group = G_SIG)
+i_sigReqConf  = input.bool(true, "需確認 K（同向位移 K 棒）", display = display.none, group = G_SIG)
+i_sigReqPD    = input.bool(true, "順勢需在折價 / 溢價區", display = display.none, group = G_SIG)
+i_sigReqKZ    = input.bool(true, "需在啟用時段內", display = display.none, group = G_SIG)
+i_sigHTFBuf   = input.float(0.3, "長 EMA 緩衝 (ATR 倍)", minval = 0.0, step = 0.05, display = display.none, group = G_SIG)
+i_sigCooldown = input.int(10, "同向訊號最少間隔 (根)", minval = 0, display = display.none, group = G_SIG)
+i_sigAplus    = input.bool(false, "只做 A+", display = display.none, group = G_SIG)
+i_trigCE      = input.bool(true, "觸發：回測 FVG 的 CE", display = display.none, group = G_SIG)
+i_trigOB      = input.bool(true, "觸發：回測 OB", display = display.none, group = G_SIG)
+i_trigSweep   = input.bool(true, "觸發：流動性掃蕩", display = display.none, group = G_SIG)
+
+// ═══════════════ ⑩ 量能與波動 ═══════════════
+i_rvolLen     = input.int(20, "RVOL 長度", minval = 5, display = display.none, group = G_VOL)
+i_rvolMin     = input.float(1.0, "訊號最低 RVOL", minval = 0.3, step = 0.1, display = display.none, group = G_VOL)
+i_volRegime   = input.int(50, "波動狀態 ATR 長度", display = display.none, group = G_VOL)
+i_volCompress = input.float(0.7, "壓縮門檻", minval = 0.4, maxval = 0.95, step = 0.05, display = display.none, group = G_VOL)
+i_volExpand   = input.float(1.3, "擴張門檻", minval = 1.05, maxval = 2.0, step = 0.05, display = display.none, group = G_VOL)
+
+// ═══════════════ ⑪ 顯示 ═══════════════
+i_ageSoft   = input.int(100, "FVG 超過幾根變淡", minval = 10, display = display.none, group = G_DRAW)
+i_ageHard   = input.int(300, "FVG 超過幾根刪除", minval = 50, display = display.none, group = G_DRAW)
+i_useDist   = input.bool(true, "隱藏離現價太遠的 FVG", display = display.none, group = G_DRAW)
+i_distMax   = input.float(8.0, "距離上限 (ATR 倍)", minval = 2.0, step = 0.5, display = display.none, group = G_DRAW)
+i_showTable = input.bool(true, "顯示儀表板", display = display.none, group = G_DRAW)
+i_tblPos    = input.string("右上", "儀表板位置", options = ["右上", "右下", "左上", "左下"], display = display.none, group = G_DRAW)
+i_bullHigh  = input.color(#00e676, "多方高分", display = display.none, group = G_DRAW)
+i_bullMed   = input.color(#26a69a, "多方中分", display = display.none, group = G_DRAW)
+i_bullLow   = input.color(#37474f, "多方低分", display = display.none, group = G_DRAW)
+i_bearHigh  = input.color(#ff1744, "空方高分", display = display.none, group = G_DRAW)
+i_bearMed   = input.color(#ff6d00, "空方中分", display = display.none, group = G_DRAW)
+i_bearLow   = input.color(#4e342e, "空方低分", display = display.none, group = G_DRAW)
+i_ifvgBull  = input.color(#7e57c2, "IFVG（原為多方）", display = display.none, group = G_DRAW)
+i_ifvgBear  = input.color(#f48fb1, "IFVG（原為空方）", display = display.none, group = G_DRAW)
+i_fillA     = input.int(88, "填色透明度", minval = 60, maxval = 98, display = display.none, group = G_DRAW)
+i_borderA   = input.int(45, "邊框透明度", minval = 0, maxval = 90, display = display.none, group = G_DRAW)
+i_dimExtra  = input.int(6, "舊 FVG 額外變淡", minval = 0, maxval = 10, display = display.none, group = G_DRAW)
+
+// ═══════════════ 基礎數值 ═══════════════
+atr     = ta.atr(i_atrLen)
+atrLong = ta.atr(i_volRegime)
+atrSafe = math.max(nz(atr), syminfo.mintick)
+emaFast = ta.ema(close, i_emaFast)
+emaSlow = ta.ema(close, i_emaSlow)
+emaHTF  = ta.ema(close, i_emaHTF)
+volMA   = ta.sma(volume, i_rvolLen)
+rvol    = volume / math.max(nz(volMA), 1)
+
+bullTrend = emaFast > emaSlow
+bearTrend = emaFast < emaSlow
+aboveHTF  = close > emaHTF + i_sigHTFBuf * atr
+belowHTF  = close < emaHTF - i_sigHTFBuf * atr
+
+volRatio      = atr / math.max(nz(atrLong), syminfo.mintick)
+volCompressed = volRatio < i_volCompress
+volExpanded   = volRatio > i_volExpand
+volNormal     = not volCompressed and not volExpanded
+
+// ═══════════════ 台股時段 ═══════════════
+intraday  = timeframe.isintraday
+inOpening = intraday and not na(time(timeframe.period, i_sessOpen,  TZ))
+inMidday  = intraday and not na(time(timeframe.period, i_sessMid,   TZ))
+inClosing = intraday and not na(time(timeframe.period, i_sessClose, TZ))
+inKZ      = (i_useOpen and inOpening) or (i_useMid and inMidday) or (i_useClose and inClosing)
+// 日線以上沒有時段概念，一律視為通過
+kzPass    = not intraday or inKZ
+
+// 09:00 = 540 分、13:30 = 810 分
+barMin     = hour(time, TZ) * 60 + minute(time, TZ)
+openBlk    = barMin >= 540 and barMin < 540 + i_avoidOpen
+closeBlk   = barMin >= 810 - i_avoidClose and barMin < 810
+lunchBlk   = i_avoidLunch and barMin >= 690 and barMin < 750
+inBlackout = i_useTimeF and intraday and (openBlk or closeBlk or lunchBlk)
+// 當天最後一根：這根結束時間到 13:30 或之後
+lastBarOfDay = intraday and barMin + timeframe.in_seconds() / 60 >= 810
+
+// ═══════════════ 位移 K 棒 ═══════════════
+f_isDisp(int ofs, bool wantBull) =>
+    body = math.abs(close[ofs] - open[ofs])
+    rng  = math.max(high[ofs] - low[ofs], syminfo.mintick)
+    dir  = wantBull ? close[ofs] > open[ofs] : close[ofs] < open[ofs]
+    body / atrSafe >= i_dispBodyAtr and body / rng >= i_dispBodyRat and dir
+
+curBullDisp  = f_isDisp(0, true)
+curBearDisp  = f_isDisp(0, false)
+midBullDisp  = f_isDisp(1, true)
+midBearDisp  = f_isDisp(1, false)
+bullVelocity = (curBullDisp ? 1 : 0) + (midBullDisp ? 1 : 0) + (f_isDisp(2, true)  ? 1 : 0)
+bearVelocity = (curBearDisp ? 1 : 0) + (midBearDisp ? 1 : 0) + (f_isDisp(2, false) ? 1 : 0)
+volRelDisp   = volume[1] / math.max(nz(volMA[1]), 1)
+
+// ═══════════════ 結構：pivot 與 HH / LL ═══════════════
+ph = ta.pivothigh(high, i_swingLen, i_swingLen)
+pl = ta.pivotlow(low,   i_swingLen, i_swingLen)
+
+var float lastSH = na
+var float prevSH = na
+var float lastSL = na
+var float prevSL = na
+
+if not na(ph)
+    prevSH := lastSH
+    lastSH := ph
+    if i_showSwings
+        label.new(bar_index - i_swingLen, ph, "H", style = label.style_none, textcolor = color.new(i_bearHigh, 30),
+             size = size.tiny, yloc = yloc.abovebar)
+if not na(pl)
+    prevSL := lastSL
+    lastSL := pl
+    if i_showSwings
+        label.new(bar_index - i_swingLen, pl, "L", style = label.style_none, textcolor = color.new(i_bullHigh, 30),
+             size = size.tiny, yloc = yloc.belowbar)
+
+isHH = not na(lastSH) and not na(prevSH) and lastSH > prevSH
+isLL = not na(lastSL) and not na(prevSL) and lastSL < prevSL
+structKnown = not na(prevSH) and not na(prevSL)
+structTxt = not structKnown ? "–" : isHH and not isLL ? "多頭 (HH)" : isLL and not isHH ? "空頭 (LL)" : isHH and isLL ? "擴張" : "收斂"
+structClr = not structKnown ? color.gray : isHH and not isLL ? i_bullHigh : isLL and not isHH ? i_bearHigh : color.orange
+
+// 溢價 / 折價：最近一組 swing 高低點的中點
+haveRange  = not na(lastSH) and not na(lastSL)
+rangeMid   = haveRange ? (math.max(lastSH, lastSL) + math.min(lastSH, lastSL)) / 2 : na
+inDiscount = haveRange and close < rangeMid
+inPremium  = haveRange and close > rangeMid
+
+// ═══════════════ 流動性掃蕩 ═══════════════
+bool sweepBull = false
+bool sweepBear = false
+if i_useSweeps and haveRange
+    sweepBull := low < lastSL and lastSL - low >= i_sweepMinWick * atr and (not i_sweepReclaim or close > lastSL)
+    sweepBear := high > lastSH and high - lastSH >= i_sweepMinWick * atr and (not i_sweepReclaim or close < lastSH)
+
+// ═══════════════ 分數 ═══════════════
+f_clamp(float v, float lo, float hi) => math.max(lo, math.min(hi, v))
+f_l(float p) =>
+    q = f_clamp(p, 0.1, 0.9)
+    math.log(q / (1.0 - q))
+
+f_score(float gapSize, float mid, bool isBull) =>
+    sizeRatio = gapSize / atrSafe
+    f1 = sizeRatio > 1.5 ? 0.82 : sizeRatio > 0.9 ? 0.65 : sizeRatio > 0.4 ? 0.50 : 0.35
+    f2 = (isBull ? bullTrend : bearTrend) ? 0.78 : 0.30
+    f3 = (isBull ? aboveHTF : belowHTF) ? 0.76 : 0.34
+    f4 = volRelDisp > 1.5 ? 0.72 : volRelDisp > 0.8 ? 0.55 : 0.38
+    f5 = not haveRange ? 0.50 : ((isBull ? mid < rangeMid : mid > rangeMid) ? 0.80 : 0.30)
+    f6 = (isBull ? isHH : isLL) ? 0.75 : 0.40
+    f7 = not intraday ? 0.50 : inKZ ? 0.68 : 0.45
+    f8 = volNormal ? 0.60 : volExpanded ? 0.75 : 0.35
+    ll = 1.2 * f_l(f1) + 1.0 * f_l(f2) + 1.0 * f_l(f3) + 0.8 * f_l(f4) + 1.5 * f_l(f5) + 1.3 * f_l(f6) + 0.7 * f_l(f7) + 0.9 * f_l(f8)
+    f_clamp(1.0 / (1.0 + math.exp(-(ll - 0.60))), 0.04, i_maxScore)
+
+f_probColor(float p, bool isBull) =>
+    tier = p >= i_highProb ? 2 : p >= i_medProb ? 1 : 0
+    isBull ? (tier == 2 ? i_bullHigh : tier == 1 ? i_bullMed : i_bullLow) : (tier == 2 ? i_bearHigh : tier == 1 ? i_bearMed : i_bearLow)
+
+f_tier(float p) => p >= i_highProb ? "H" : p >= i_medProb ? "M" : "L"
+f_pct(float p)  => str.tostring(math.round(p * 100)) + "%"
+
+// ═══════════════ FVG ═══════════════
+// state：0 新生、1 已碰 CE、3 IFVG
+type FVG
+    float top
+    float btm
+    bool  isBull
+    bool  origBull
+    float score
+    int   state
+    int   birth
+    box   bx
+    line  ce
+
+var array<FVG> fvgs = array.new<FVG>()
+
+f_overlaps(float t, float b) =>
+    bool hit = false
+    for f in fvgs
+        if t >= f.btm and b <= f.top
+            hit := true
+            break
+    hit
+
+f_newFVG(float t, float b, bool isBull, float gapSize) =>
+    mid = (t + b) / 2
+    p   = f_score(gapSize, mid, isBull)
+    c   = f_probColor(p, isBull)
+    bx  = box.new(bar_index - 2, t, bar_index, b, bgcolor = color.new(c, i_fillA), border_color = color.new(c, i_borderA),
+         extend = extend.right, text = f_tier(p) + " " + f_pct(p), text_color = color.new(c, 10), text_size = size.small,
+         text_halign = text.align_right, text_valign = text.align_top)
+    line ce = na
+    if i_showCE
+        ce := line.new(bar_index - 2, mid, bar_index, mid, color = color.new(c, 30), style = line.style_dotted, extend = extend.right)
+    array.push(fvgs, FVG.new(t, b, isBull, isBull, p, 0, bar_index, bx, ce))
+
+bullGap = low - high[2]
+bearGap = low[2] - high
+bullFVG = bullGap > 0 and bullGap >= i_minAtrMult * atr and (not i_useDisp or midBullDisp)
+bearFVG = bearGap > 0 and bearGap >= i_minAtrMult * atr and (not i_useDisp or midBearDisp)
+
+if bullFVG and not f_overlaps(low, high[2])
+    f_newFVG(low, high[2], true, bullGap)
+if bearFVG and not f_overlaps(low[2], high)
+    f_newFVG(low[2], high, false, bearGap)
+
+// ── FVG 生命週期 ──
+atrDist = i_ifvgDist * atr
+bool  ceTapBull   = false
+bool  ceTapBear   = false
+float ceBullScore = 0.0
+float ceBearScore = 0.0
+
+if array.size(fvgs) > 0
+    for i = array.size(fvgs) - 1 to 0
+        f    = array.get(fvgs, i)
+        mid  = (f.top + f.btm) / 2
+        bool kill = bar_index - f.birth > i_ageHard
+
+        if not kill and f.state < 3
+            // 第一次碰到 CE：記成觸發，同方向取分數最高的那個
+            if f.state == 0 and (f.isBull ? low <= mid : high >= mid)
+                f.state := 1
+                if f.isBull and f.score > ceBullScore
+                    ceTapBull   := true
+                    ceBullScore := f.score
+                if not f.isBull and f.score > ceBearScore
+                    ceTapBear   := true
+                    ceBearScore := f.score
+
+            fullFill = f.isBull ? low <= f.btm : high >= f.top
+            if fullFill
+                closeBeyond = f.isBull ? close < f.btm : close > f.top
+                distOk   = f.isBull ? f.btm - close >= atrDist : close - f.top >= atrDist
+                dispOk   = not i_ifvgDisp or (f.isBull ? curBearDisp : curBullDisp)
+                structOk = not i_ifvgStruct or (f.isBull ? isLL : isHH)
+                sessOk   = not i_ifvgKzOnly or kzPass
+                if i_trackIFVG and closeBeyond and distOk and dispOk and structOk and sessOk
+                    if i_ifvgRedraw
+                        f.top := math.max(open, close)
+                        f.btm := math.min(open, close)
+                        box.set_left(f.bx, bar_index)
+                        box.set_top(f.bx, f.top)
+                        box.set_bottom(f.bx, f.btm)
+                        if not na(f.ce)
+                            newMid = (f.top + f.btm) / 2
+                            line.set_xy1(f.ce, bar_index, newMid)
+                            line.set_y2(f.ce, newMid)
+                    f.isBull := not f.isBull
+                    f.state  := 3
+                else
+                    kill := i_fvgMitig == "影線回補" or closeBeyond
+        else if not kill and f.state == 3
+            // IFVG 被收盤反向穿越就移除（剛轉成 IFVG 的當根走上面的分支，不會檢查）
+            kill := f.isBull ? close < f.btm : close > f.top
+
+        if kill
+            box.delete(f.bx)
+            line.delete(f.ce)
+            array.remove(fvgs, i)
+
+while array.size(fvgs) > 150
+    old = array.shift(fvgs)
+    box.delete(old.bx)
+    line.delete(old.ce)
+
+// FVG 外觀：只在最後一根重算（變淡、隱藏太遠的）
+if barstate.islast
+    for f in fvgs
+        mid  = (f.top + f.btm) / 2
+        far  = i_useDist and math.abs(close - mid) / atrSafe > i_distMax
+        aged = bar_index - f.birth > i_ageSoft
+        c = f.state == 3 ? (f.origBull ? i_ifvgBull : i_ifvgBear) : f_probColor(f.score, f.isBull)
+        fillA   = math.min(98, (f.state == 3 ? i_fillA - 5 : i_fillA) + (aged ? i_dimExtra : 0))
+        borderA = math.min(95, i_borderA + (aged ? i_dimExtra + 10 : 0))
+        hidden  = color.new(color.gray, 100)
+        box.set_bgcolor(f.bx, far ? hidden : color.new(c, fillA))
+        box.set_border_color(f.bx, far ? hidden : color.new(c, borderA))
+        box.set_border_width(f.bx, f.state == 1 ? 2 : 1)
+        box.set_text(f.bx, far ? "" : (f.state == 3 ? "IFVG " : f_tier(f.score) + " ") + f_pct(f.score))
+        box.set_text_color(f.bx, color.new(c, 10))
+        if not na(f.ce)
+            line.set_color(f.ce, far ? hidden : color.new(c, 30))
+
+// ═══════════════ 內部 OB（只當觸發，不畫）═══════════════
+type OB
+    float top
+    float btm
+    bool  isBull
+    int   origin
+    int   created
+
+var array<OB> obs = array.new<OB>()
+
+// 出現位移 K 棒時，往前找最近一根反向 K 當作 OB
+f_findOB(bool trigger, bool isBull) =>
+    bool found = false
+    if trigger
+        for k = 1 to i_obLookback
+            if isBull ? close[k] < open[k] : close[k] > open[k]
+                t = high[k]
+                b = low[k]
+                bool dup = false
+                for o in obs
+                    if math.abs(o.top - t) < syminfo.mintick and math.abs(o.btm - b) < syminfo.mintick
+                        dup := true
+                        break
+                if not dup
+                    array.push(obs, OB.new(t, b, isBull, bar_index - k, bar_index))
+                    found := true
+                break
+    found
+
+f_findOB(i_useOB and curBullDisp, true)
+f_findOB(i_useOB and curBearDisp, false)
+
+// 回測：影線伸進 OB、收盤沒跌破（多方）；成立當根不算。穿越另一端或太舊就移除
+bool obRetestBull = false
+bool obRetestBear = false
+if array.size(obs) > 0
+    for i = array.size(obs) - 1 to 0
+        o = array.get(obs, i)
+        bool kill = bar_index - o.origin > i_obMaxAge
+        if not kill and bar_index > o.created
+            if o.isBull
+                obRetestBull := obRetestBull or (low <= o.top and low >= o.btm and close > o.btm)
+                kill := close < o.btm
+            else
+                obRetestBear := obRetestBear or (high >= o.btm and high <= o.top and close < o.top)
+                kill := close > o.top
+        if kill
+            array.remove(obs, i)
+while array.size(obs) > 20
+    array.shift(obs)
+
+// ═══════════════ 訊號引擎 ═══════════════
+// 觸發看前一根，當根負責確認
+trigLongCE     = i_trigCE    and ceTapBull[1]
+trigShortCE    = i_trigCE    and ceTapBear[1]
+trigLongOB     = i_trigOB    and obRetestBull[1]
+trigShortOB    = i_trigOB    and obRetestBear[1]
+trigLongSweep  = i_trigSweep and sweepBull[1]
+trigShortSweep = i_trigSweep and sweepBear[1]
+trigScoreLong  = ceBullScore[1]
+trigScoreShort = ceBearScore[1]
+
+anyLong  = trigLongCE  or trigLongOB  or trigLongSweep
+anyShort = trigShortCE or trigShortOB or trigShortSweep
+
+// 有 CE 觸發時，那個 FVG 的分數要夠高
+scoreOkLong  = not trigLongCE  or trigScoreLong  >= i_sigMinScore
+scoreOkShort = not trigShortCE or trigScoreShort >= i_sigMinScore
+
+var int lastLongBar  = -100000
+var int lastShortBar = -100000
+coolLong  = bar_index - lastLongBar  >= i_sigCooldown
+coolShort = bar_index - lastShortBar >= i_sigCooldown
+
+rvolOk       = rvol >= i_rvolMin
+kzOk         = not i_sigReqKZ or kzPass
+confirmLong  = not i_sigReqConf or curBullDisp
+confirmShort = not i_sigReqConf or curBearDisp
+baseCtx      = rvolOk and kzOk and not inBlackout and not volCompressed
+
+trendLong  = bullTrend and isHH and aboveHTF
+trendShort = bearTrend and isLL and belowHTF
+pdLong     = not i_sigReqPD or inDiscount
+pdShort    = not i_sigReqPD or inPremium
+
+canTrendLong  = baseCtx and anyLong  and confirmLong  and scoreOkLong  and trendLong  and pdLong  and coolLong
+canTrendShort = baseCtx and anyShort and confirmShort and scoreOkShort and trendShort and pdShort and coolShort
+canRevLong    = baseCtx and trigLongSweep  and confirmLong  and bearTrend and coolLong
+canRevShort   = baseCtx and trigShortSweep and confirmShort and bullTrend and coolShort
+
+// 只在 K 棒收盤後成立
+gate      = barstate.isconfirmed
+modeTrend = i_sigMode != "反轉"
+modeRev   = i_sigMode != "順勢"
+
+fireTrendLong  = gate and modeTrend and canTrendLong
+fireTrendShort = gate and modeTrend and canTrendShort
+fireRevLong    = gate and modeRev   and canRevLong
+fireRevShort   = gate and modeRev   and canRevShort
+
+// A+：順勢、2 種以上觸發、波動擴張、近 3 根有 2 根位移
+// A ：順勢，且 2 種以上觸發，或高分 FVG 加上位移動能
+f_grade(bool isLong, bool isTrend) =>
+    nLong   = (trigLongCE  ? 1 : 0) + (trigLongOB  ? 1 : 0) + (trigLongSweep  ? 1 : 0)
+    nShort  = (trigShortCE ? 1 : 0) + (trigShortOB ? 1 : 0) + (trigShortSweep ? 1 : 0)
+    n       = isLong ? nLong : nShort
+    velOk   = isLong ? bullVelocity >= 2 : bearVelocity >= 2
+    hiScore = (isLong ? trigScoreLong : trigScoreShort) >= i_highProb
+    isTrend and n >= 2 and volExpanded and velOk ? "A+" : isTrend and (n >= 2 or (hiScore and velOk)) ? "A" : "B"
+
+longGrade  = fireTrendLong  ? f_grade(true,  true) : fireRevLong  ? f_grade(true,  false) : ""
+shortGrade = fireTrendShort ? f_grade(false, true) : fireRevShort ? f_grade(false, false) : ""
+
+longFire  = (fireTrendLong  or fireRevLong)  and (not i_sigAplus or longGrade  == "A+")
+shortFire = (fireTrendShort or fireRevShort) and (not i_sigAplus or shortGrade == "A+")
+
+if longFire
+    lastLongBar := bar_index
+    label.new(bar_index, low, (fireTrendLong ? "TRND " : "REV ") + longGrade, color = color.new(i_bullHigh, 20),
+         textcolor = color.white, style = label.style_label_up, yloc = yloc.belowbar, size = size.small)
+if shortFire
+    lastShortBar := bar_index
+    label.new(bar_index, high, (fireTrendShort ? "TRND " : "REV ") + shortGrade, color = color.new(i_bearHigh, 20),
+         textcolor = color.white, style = label.style_label_down, yloc = yloc.abovebar, size = size.small)
+
+// ═══════════════ 下單 ═══════════════
+// 訊號在收盤成立，下一根開盤進場；停損與目標用訊號那根的收盤價計算
+allowLong  = i_dir != "只做空"
+allowShort = i_dir != "只做多"
+
+lowN  = ta.lowest(low, i_slBars)
+highN = ta.highest(high, i_slBars)
+useAtrStop = i_slMode == "ATR"
+stopLong   = useAtrStop ? close - i_slAtr * atrSafe : lowN  - i_slBuf * atrSafe
+stopShort  = useAtrStop ? close + i_slAtr * atrSafe : highN + i_slBuf * atrSafe
+
+if longFire and allowLong and strategy.position_size <= 0
+    risk = close - stopLong
+    if risk > syminfo.mintick
+        strategy.entry("多", strategy.long, comment = longGrade)
+        strategy.exit("多出", "多", stop = stopLong, limit = close + i_rr * risk)
+
+if shortFire and allowShort and strategy.position_size >= 0
+    risk = stopShort - close
+    if risk > syminfo.mintick
+        strategy.entry("空", strategy.short, comment = shortGrade)
+        strategy.exit("空出", "空", stop = stopShort, limit = close - i_rr * risk)
+
+// 持有太久，或日內週期的當天最後一根，直接平倉
+if strategy.position_size != 0
+    held = bar_index - strategy.opentrades.entry_bar_index(strategy.opentrades - 1)
+    if i_maxBars > 0 and held >= i_maxBars
+        strategy.close_all(comment = "逾時")
+    else if i_flatEOD and lastBarOfDay
+        strategy.close_all(comment = "收盤平倉", immediately = true)
+
+if longFire or shortFire
+    alert(syminfo.ticker + (longFire ? " 多方訊號 " + longGrade : " 空方訊號 " + shortGrade), alert.freq_once_per_bar_close)
+
+plot(i_showEMA ? emaFast : na, "快 EMA", color = color.new(color.blue,   55), linewidth = 1, display = display.pane)
+plot(i_showEMA ? emaSlow : na, "慢 EMA", color = color.new(color.orange, 55), linewidth = 1, display = display.pane)
+plot(i_showEMA ? emaHTF  : na, "長 EMA", color = color.new(color.purple, 35), linewidth = 2, display = display.pane)
+
+// ═══════════════ 儀表板 ═══════════════
+f_tblPos() =>
+    switch i_tblPos
+        "右上" => position.top_right
+        "右下" => position.bottom_right
+        "左上" => position.top_left
+        => position.bottom_left
+
+var table tb = i_showTable ? table.new(f_tblPos(), 2, 7, bgcolor = color.new(#1e222d, 10),
+     border_color = color.new(color.gray, 70), border_width = 1) : na
+
+f_row(int r, string k, string v, color c) =>
+    table.cell(tb, 0, r, k, text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(tb, 1, r, v, text_color = c, text_size = size.small)
+
+if i_showTable and barstate.islast
+    table.cell(tb, 0, 0, "台股 FVG 策略", text_color = color.white, bgcolor = color.new(color.gray, 30), text_size = size.small)
+    table.cell(tb, 1, 0, "狀態", text_color = color.white, bgcolor = color.new(color.gray, 30), text_size = size.small)
+    f_row(1, "EMA 趨勢", bullTrend ? "多頭" : bearTrend ? "空頭" : "–", bullTrend ? i_bullHigh : bearTrend ? i_bearHigh : color.gray)
+    f_row(2, "HH / LL 結構", structTxt, structClr)
+    f_row(3, "區間位置", inDiscount ? "折價區" : inPremium ? "溢價區" : "–", inDiscount ? i_bullMed : inPremium ? i_bearMed : color.gray)
+    f_row(4, "波動", volExpanded ? "擴張" : volCompressed ? "壓縮" : "正常", volExpanded ? i_bullHigh : volCompressed ? i_bearHigh : color.white)
+    f_row(5, "RVOL", str.tostring(rvol, "#.##") + "x", rvolOk ? i_bullMed : color.gray)
+    f_row(6, "時段", not intraday ? "日線以上" : inBlackout ? "禁止時段" : inOpening ? "早盤" : inMidday ? "中盤" : inClosing ? "尾盤" : "盤外",
+         inBlackout ? i_bearMed : kzPass ? color.yellow : color.gray)

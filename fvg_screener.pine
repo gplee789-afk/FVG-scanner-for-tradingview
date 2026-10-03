@@ -1,0 +1,508 @@
+//@version=6
+// FVG 掃描器（台股）— 單週期 × 40 檔，單一 alert
+//
+// 版面與用法照 SMC OB 掃描器（https://github.com/gplee789-afk/SMC-ob-scanner-for-tradingview-v2 的 pine/smc_ob_screener.pine）；每檔的判斷用 fvg_prob_strategy.pine 的邏輯
+// （GainzAlgo "FVG with Probabilities" 台股版：FVG、分數、IFVG、內部 OB、掃蕩、訊號引擎）。
+// request.security 裡不能畫圖，所以這裡是不畫框的純計算版，判斷規則相同。
+// 分數是寫死權重的評分，不是機率。
+indicator("FVG Screener TW", overlay = false, max_bars_back = 500)
+
+TZ = "Asia/Taipei"
+
+G_SCAN = "① 掃描"
+G_SYM  = "② 代號清單"
+G_DISP = "③ 顯示"
+G_ALRT = "④ 警報"
+G_SIG  = "⑤ 訊號邏輯（同 fvg_prob_strategy）"
+
+// ═══════════════ ① 掃描 ═══════════════
+tf = input.timeframe("30", "掃描週期", group = G_SCAN,
+     tooltip = "一份腳本只掃一個週期。圖表週期必須小於或等於掃描週期。")
+nearPct = input.float(1.5, "「快碰到」門檻(%)", minval = 0.1, step = 0.5, group = G_SCAN,
+     tooltip = "離最近的 FVG 在這個百分比以內會上色，但不發警報。")
+i_calcBars = input.int(1500, "每檔計算幾根 K 棒", minval = 300, maxval = 5000, group = G_SCAN,
+     tooltip = "越多越慢。EMA200 需要約 200 根暖機，1500 根通常就夠。跑不動時先降到 800。")
+
+// ═══════════════ ② 代號清單 ═══════════════
+symTxt = input.text_area(
+     "TWSE:2330\nTWSE:2317\nTWSE:2454\nTWSE:2382\nTWSE:2308\nTWSE:3231\nTWSE:2303\nTWSE:3037\nTWSE:2368\nTPEX:6488",
+     "代號（每行一檔，上限 40）", group = G_SYM,
+     tooltip = "格式：交易所:代號，例如 TWSE:2330（上市）、TPEX:6488（上櫃）。\n一行一檔；逗號、空格分隔也可以。超過 40 檔的部分會被忽略。")
+
+// ═══════════════ ③ 顯示 ═══════════════
+showRows = input.int(20, "顯示前幾名", minval = 5, maxval = 40, group = G_DISP)
+perCol   = input.int(5, "每欄幾檔", minval = 5, maxval = 40, group = G_DISP)
+txtSize  = input.string("normal", "字級", options = ["small", "normal", "large", "huge"], group = G_DISP)
+tblPos   = input.string("正中", "表格位置", options = ["正中", "中上", "中下", "右上", "右下", "左上", "左下"], group = G_DISP)
+
+// ═══════════════ ④ 警報 ═══════════════
+i_alSig      = input.bool(true, "訊號（TRND / REV）", group = G_ALRT)
+i_alEnter    = input.bool(false, "進入 FVG", group = G_ALRT,
+     tooltip = "價格從外面進入 FVG 的那一根發警報，只算分數不低於下面門檻的 FVG。")
+i_alMinScore = input.float(0.65, "進入 FVG 的最低分數", minval = 0.0, maxval = 0.95, step = 0.05, group = G_ALRT)
+
+// ═══════════════ ⑤ 訊號邏輯（主要參數；其餘固定用策略預設值）═══════════════
+i_atrLen      = input.int(14, "ATR 長度", minval = 1, group = G_SIG)
+i_minAtrMult  = input.float(0.3, "最小缺口 (ATR 倍)", minval = 0.05, step = 0.05, group = G_SIG)
+i_useDisp     = input.bool(true, "FVG 中間那根需為位移 K 棒", group = G_SIG)
+i_dispBodyAtr = input.float(0.6, "位移：最小實體 (ATR 倍)", minval = 0.1, step = 0.05, group = G_SIG)
+i_dispBodyRat = input.float(0.6, "位移：最小實體 / 全長", minval = 0.3, maxval = 0.95, step = 0.05, group = G_SIG)
+i_fvgMitig    = input.string("影線回補", "FVG 失效判定", options = ["影線回補", "收盤穿越"], group = G_SIG)
+i_trackIFVG   = input.bool(true, "追蹤 IFVG", group = G_SIG)
+i_highProb    = input.float(0.65, "高分門檻 (H)", minval = 0.5, maxval = 0.99, step = 0.01, group = G_SIG)
+i_medProb     = input.float(0.45, "中分門檻 (M)", minval = 0.2, maxval = 0.64, step = 0.01, group = G_SIG)
+i_maxScore    = input.float(0.85, "分數上限", minval = 0.70, maxval = 0.98, step = 0.01, group = G_SIG)
+i_swingLen    = input.int(5, "Pivot 左右根數", minval = 2, maxval = 20, group = G_SIG)
+i_sigMode     = input.string("兩者", "訊號種類", options = ["順勢", "反轉", "兩者"], group = G_SIG)
+i_sigMinScore = input.float(0.60, "CE 觸發的最低 FVG 分數", minval = 0.40, maxval = 0.95, step = 0.01, group = G_SIG)
+i_sigReqConf  = input.bool(true, "需確認 K（同向位移 K 棒）", group = G_SIG)
+i_sigReqPD    = input.bool(true, "順勢需在折價 / 溢價區", group = G_SIG)
+i_sigReqKZ    = input.bool(true, "需在啟用時段內", group = G_SIG)
+i_sigCooldown = input.int(10, "同向訊號最少間隔 (根)", minval = 0, group = G_SIG)
+i_rvolMin     = input.float(1.0, "訊號最低 RVOL", minval = 0.3, step = 0.1, group = G_SIG)
+i_trigCE      = input.bool(true, "觸發：回測 FVG 的 CE", group = G_SIG)
+i_trigOB      = input.bool(true, "觸發：回測 OB", group = G_SIG)
+i_trigSweep   = input.bool(true, "觸發：流動性掃蕩", group = G_SIG)
+i_useOpen     = input.bool(true, "早盤", inline = "kz", group = G_SIG)
+i_useMid      = input.bool(true, "中盤", inline = "kz", group = G_SIG)
+i_useClose    = input.bool(true, "尾盤", inline = "kz", group = G_SIG,
+     tooltip = "勾選的時段算「啟用時段」（早 09:00–10:30、中 10:30–12:30、尾 12:30–13:30）。")
+i_useTimeF    = input.bool(true, "開盤後 5 分、收盤前 15 分、11:30–12:30 不出訊號", group = G_SIG,
+     tooltip = "只在日內週期生效。")
+
+f_size() =>
+    switch txtSize
+        "small"  => size.small
+        "normal" => size.normal
+        "large"  => size.large
+        => size.huge
+
+f_pos() =>
+    switch tblPos
+        "中上" => position.top_center
+        "中下" => position.bottom_center
+        "右上" => position.top_right
+        "右下" => position.bottom_right
+        "左上" => position.top_left
+        "左下" => position.bottom_left
+        => position.middle_center
+
+// 表頭的週期文字：分鐘週期加 m，日 / 週 / 月照原樣
+f_tfLabel(string s) => str.contains(s, "D") or str.contains(s, "W") or str.contains(s, "M") ? s : s + "m"
+
+// ── 配色（同 OB 掃描器，另加訊號色）──
+C_HEAD     = #1f2933
+C_HEADTXT  = #c9d3df
+C_LINE     = #2c3846
+C_ROW_A    = #161b22
+C_ROW_B    = #1b2028
+C_SYMTXT   = #7d8996
+C_DIM      = #5a6572
+C_BULL_SIG = #00a35a
+C_BEAR_SIG = #c62a3d
+C_BULL_HIT = #0f7a52
+C_BEAR_HIT = #9e2b3a
+C_BULL_NEAR= #12312a
+C_BEAR_NEAR= #33181e
+C_BULL_TXT = #4ad9a0
+C_BEAR_TXT = #ff7b8a
+C_ROW_HIT  = #2a3340
+
+// ═══════════════ 型別 ═══════════════
+// FVG：state 0 新生、1 已碰 CE、3 IFVG
+type FZ
+    float top
+    float btm
+    bool  isBull
+    bool  origBull
+    float score
+    int   state
+    int   birth
+
+type IOB
+    float top
+    float btm
+    bool  isBull
+    int   origin
+    int   created
+
+// ═══════════════ 全域函式（不能寫在 fvgScan 裡）═══════════════
+f_isDisp(int ofs, bool wantBull, float atrS) =>
+    body = math.abs(close[ofs] - open[ofs])
+    rng  = math.max(high[ofs] - low[ofs], syminfo.mintick)
+    dir  = wantBull ? close[ofs] > open[ofs] : close[ofs] < open[ofs]
+    body / atrS >= i_dispBodyAtr and body / rng >= i_dispBodyRat and dir
+
+f_clamp(float v, float lo, float hi) => math.max(lo, math.min(hi, v))
+f_l(float p) =>
+    q = f_clamp(p, 0.1, 0.9)
+    math.log(q / (1.0 - q))
+
+// 8 因子分數（同策略）：f5、f7 由呼叫端算好傳進來
+f_score(float gapRatio, bool fav2, bool fav3, float volRel, float f5, bool fav6, float f7, bool volN, bool volE) =>
+    f1 = gapRatio > 1.5 ? 0.82 : gapRatio > 0.9 ? 0.65 : gapRatio > 0.4 ? 0.50 : 0.35
+    f2 = fav2 ? 0.78 : 0.30
+    f3 = fav3 ? 0.76 : 0.34
+    f4 = volRel > 1.5 ? 0.72 : volRel > 0.8 ? 0.55 : 0.38
+    f6 = fav6 ? 0.75 : 0.40
+    f8 = volN ? 0.60 : volE ? 0.75 : 0.35
+    ll = 1.2 * f_l(f1) + 1.0 * f_l(f2) + 1.0 * f_l(f3) + 0.8 * f_l(f4) + 1.5 * f_l(f5) + 1.3 * f_l(f6) + 0.7 * f_l(f7) + 0.9 * f_l(f8)
+    f_clamp(1.0 / (1.0 + math.exp(-(ll - 0.60))), 0.04, i_maxScore)
+
+f_tier(float p) => p >= i_highProb ? "H" : p >= i_medProb ? "M" : "L"
+f_pct(float p)  => str.tostring(math.round(p * 100)) + "%"
+
+f_overlaps(array<FZ> a, float t, float b) =>
+    bool hit = false
+    for f in a
+        if t >= f.btm and b <= f.top
+            hit := true
+            break
+    hit
+
+// 出現位移 K 棒時，往前 10 根找最近一根反向 K 當作 OB
+f_findOB(array<IOB> obs, bool trigger, bool isBull) =>
+    bool found = false
+    if trigger
+        for k = 1 to 10
+            if isBull ? close[k] < open[k] : close[k] > open[k]
+                t = high[k]
+                b = low[k]
+                bool dup = false
+                for o in obs
+                    if math.abs(o.top - t) < syminfo.mintick and math.abs(o.btm - b) < syminfo.mintick
+                        dup := true
+                        break
+                if not dup
+                    array.push(obs, IOB.new(t, b, isBull, bar_index - k, bar_index))
+                    found := true
+                break
+    found
+
+// ═══════════════ 掃描主函式（每檔在 request.security 裡跑一次）═══════════════
+fvgScan() =>
+    // ── 基礎數值（EMA 20 / 50 / 200、RVOL 20、波動 ATR 50 等同策略預設）──
+    atr      = ta.atr(i_atrLen)
+    atrS     = math.max(nz(atr), syminfo.mintick)
+    atrLong  = ta.atr(50)
+    emaF     = ta.ema(close, 20)
+    emaS     = ta.ema(close, 50)
+    emaH     = ta.ema(close, 200)
+    volMA    = ta.sma(volume, 20)
+    rvol     = volume / math.max(nz(volMA), 1)
+    bullTrend = emaF > emaS
+    bearTrend = emaF < emaS
+    aboveHTF  = close > emaH + 0.3 * atr
+    belowHTF  = close < emaH - 0.3 * atr
+    volRatio  = atr / math.max(nz(atrLong), syminfo.mintick)
+    volComp   = volRatio < 0.7
+    volExp    = volRatio > 1.3
+    volNorm   = not volComp and not volExp
+
+    // ── 台股時段 ──
+    intraday = timeframe.isintraday
+    inOpen   = intraday and not na(time(timeframe.period, "0900-1030", TZ))
+    inMid    = intraday and not na(time(timeframe.period, "1030-1230", TZ))
+    inClose  = intraday and not na(time(timeframe.period, "1230-1330", TZ))
+    inKZ     = (i_useOpen and inOpen) or (i_useMid and inMid) or (i_useClose and inClose)
+    kzPass   = not intraday or inKZ
+    barMin   = hour(time, TZ) * 60 + minute(time, TZ)
+    blk      = i_useTimeF and intraday and ((barMin >= 540 and barMin < 545) or (barMin >= 795 and barMin < 810) or (barMin >= 690 and barMin < 750))
+    f7       = not intraday ? 0.50 : inKZ ? 0.68 : 0.45
+
+    // ── 位移 K 棒 ──
+    bDispC = f_isDisp(0, true,  atrS)
+    sDispC = f_isDisp(0, false, atrS)
+    bDispM = f_isDisp(1, true,  atrS)
+    sDispM = f_isDisp(1, false, atrS)
+    bVel   = (bDispC ? 1 : 0) + (bDispM ? 1 : 0) + (f_isDisp(2, true,  atrS) ? 1 : 0)
+    sVel   = (sDispC ? 1 : 0) + (sDispM ? 1 : 0) + (f_isDisp(2, false, atrS) ? 1 : 0)
+    volRelDisp = volume[1] / math.max(nz(volMA[1]), 1)
+
+    // ── 結構：pivot 與 HH / LL、溢價 / 折價、掃蕩 ──
+    ph = ta.pivothigh(high, i_swingLen, i_swingLen)
+    pl = ta.pivotlow(low,   i_swingLen, i_swingLen)
+    var float lastSH = na
+    var float prevSH = na
+    var float lastSL = na
+    var float prevSL = na
+    if not na(ph)
+        prevSH := lastSH
+        lastSH := ph
+    if not na(pl)
+        prevSL := lastSL
+        lastSL := pl
+    isHH      = not na(lastSH) and not na(prevSH) and lastSH > prevSH
+    isLL      = not na(lastSL) and not na(prevSL) and lastSL < prevSL
+    haveRange = not na(lastSH) and not na(lastSL)
+    rangeMid  = haveRange ? (lastSH + lastSL) / 2 : na
+    inDisc    = haveRange and close < rangeMid
+    inPrem    = haveRange and close > rangeMid
+    sweepBull = haveRange and low < lastSL and lastSL - low >= 0.3 * atr and close > lastSL
+    sweepBear = haveRange and high > lastSH and high - lastSH >= 0.3 * atr and close < lastSH
+
+    // ── FVG 產生 ──
+    var array<FZ> fz = array.new<FZ>()
+    bullGap = low - high[2]
+    bearGap = low[2] - high
+    if bullGap > 0 and bullGap >= i_minAtrMult * atr and (not i_useDisp or bDispM) and not f_overlaps(fz, low, high[2])
+        mid = (low + high[2]) / 2
+        f5  = not haveRange ? 0.50 : mid < rangeMid ? 0.80 : 0.30
+        array.push(fz, FZ.new(low, high[2], true, true, f_score(bullGap / atrS, bullTrend, aboveHTF, volRelDisp, f5, isHH, f7, volNorm, volExp), 0, bar_index))
+    if bearGap > 0 and bearGap >= i_minAtrMult * atr and (not i_useDisp or sDispM) and not f_overlaps(fz, low[2], high)
+        mid = (low[2] + high) / 2
+        f5  = not haveRange ? 0.50 : mid > rangeMid ? 0.80 : 0.30
+        array.push(fz, FZ.new(low[2], high, false, false, f_score(bearGap / atrS, bearTrend, belowHTF, volRelDisp, f5, isLL, f7, volNorm, volExp), 0, bar_index))
+
+    // ── FVG 生命週期：碰 CE、轉 IFVG、失效 ──
+    bool  tapBull   = false
+    bool  tapBear   = false
+    float tapBullSc = 0.0
+    float tapBearSc = 0.0
+    if array.size(fz) > 0
+        for i = array.size(fz) - 1 to 0
+            f   = array.get(fz, i)
+            mid = (f.top + f.btm) / 2
+            bool kill = bar_index - f.birth > 300
+            if not kill and f.state < 3
+                if f.state == 0 and (f.isBull ? low <= mid : high >= mid)
+                    f.state := 1
+                    if f.isBull and f.score > tapBullSc
+                        tapBull   := true
+                        tapBullSc := f.score
+                    if not f.isBull and f.score > tapBearSc
+                        tapBear   := true
+                        tapBearSc := f.score
+                if f.isBull ? low <= f.btm : high >= f.top
+                    closeBeyond = f.isBull ? close < f.btm : close > f.top
+                    distOk = f.isBull ? f.btm - close >= 0.3 * atr : close - f.top >= 0.3 * atr
+                    dispOk = f.isBull ? sDispC : bDispC
+                    strOk  = f.isBull ? isLL : isHH
+                    if i_trackIFVG and closeBeyond and distOk and dispOk and strOk
+                        f.top    := math.max(open, close)
+                        f.btm    := math.min(open, close)
+                        f.isBull := not f.isBull
+                        f.state  := 3
+                    else
+                        kill := i_fvgMitig == "影線回補" or closeBeyond
+            else if not kill and f.state == 3
+                kill := f.isBull ? close < f.btm : close > f.top
+            if kill
+                array.remove(fz, i)
+    while array.size(fz) > 30
+        array.shift(fz)
+
+    // ── 內部 OB（只當觸發）──
+    var array<IOB> obs = array.new<IOB>()
+    f_findOB(obs, bDispC, true)
+    f_findOB(obs, sDispC, false)
+    bool obBull = false
+    bool obBear = false
+    if array.size(obs) > 0
+        for i = array.size(obs) - 1 to 0
+            o = array.get(obs, i)
+            bool kill = bar_index - o.origin > 100
+            if not kill and bar_index > o.created
+                if o.isBull
+                    obBull := obBull or (low <= o.top and low >= o.btm and close > o.btm)
+                    kill   := close < o.btm
+                else
+                    obBear := obBear or (high >= o.btm and high <= o.top and close < o.top)
+                    kill   := close > o.top
+            if kill
+                array.remove(obs, i)
+    while array.size(obs) > 10
+        array.shift(obs)
+
+    // ── 訊號引擎（觸發看前一根，當根確認）──
+    tLCE = i_trigCE    and tapBull[1]
+    tSCE = i_trigCE    and tapBear[1]
+    tLOB = i_trigOB    and obBull[1]
+    tSOB = i_trigOB    and obBear[1]
+    tLSw = i_trigSweep and sweepBull[1]
+    tSSw = i_trigSweep and sweepBear[1]
+    scL  = tapBullSc[1]
+    scS  = tapBearSc[1]
+
+    var int lastL = -100000
+    var int lastS = -100000
+    base   = rvol >= i_rvolMin and (not i_sigReqKZ or kzPass) and not blk and not volComp
+    modeT  = i_sigMode != "反轉"
+    modeR  = i_sigMode != "順勢"
+    trendL = modeT and base and (tLCE or tLOB or tLSw) and (not i_sigReqConf or bDispC) and (not tLCE or scL >= i_sigMinScore) and
+         bullTrend and isHH and aboveHTF and (not i_sigReqPD or inDisc) and bar_index - lastL >= i_sigCooldown
+    trendS = modeT and base and (tSCE or tSOB or tSSw) and (not i_sigReqConf or sDispC) and (not tSCE or scS >= i_sigMinScore) and
+         bearTrend and isLL and belowHTF and (not i_sigReqPD or inPrem) and bar_index - lastS >= i_sigCooldown
+    revL   = modeR and base and tLSw and (not i_sigReqConf or bDispC) and bearTrend and bar_index - lastL >= i_sigCooldown
+    revS   = modeR and base and tSSw and (not i_sigReqConf or sDispC) and bullTrend and bar_index - lastS >= i_sigCooldown
+
+    nL = (tLCE ? 1 : 0) + (tLOB ? 1 : 0) + (tLSw ? 1 : 0)
+    nS = (tSCE ? 1 : 0) + (tSOB ? 1 : 0) + (tSSw ? 1 : 0)
+    // 分級：3 = A+、2 = A、1 = B
+    gL = trendL ? (nL >= 2 and volExp and bVel >= 2 ? 3 : nL >= 2 or (scL >= i_highProb and bVel >= 2) ? 2 : 1) : 1
+    gS = trendS ? (nS >= 2 and volExp and sVel >= 2 ? 3 : nS >= 2 or (scS >= i_highProb and sVel >= 2) ? 2 : 1) : 1
+
+    sigDir = trendL or revL ? 1 : trendS or revS ? -1 : 0
+    sigRev = sigDir == 1 ? not trendL : sigDir == -1 ? not trendS : false
+    grade  = sigDir == 1 ? gL : sigDir == -1 ? gS : 0
+    if sigDir == 1
+        lastL := bar_index
+    if sigDir == -1
+        lastS := bar_index
+
+    // ── 最近的多方 / 空方 FVG（含 IFVG）、是否在裡面 ──
+    float bTop = na
+    float bBtm = na
+    float bSc  = na
+    bool  bIF  = false
+    float sTop = na
+    float sBtm = na
+    float sSc  = na
+    bool  sIF  = false
+    bool  inB  = false
+    bool  inS  = false
+    for f in fz
+        isIn = low <= f.top and high >= f.btm
+        if f.isBull
+            inB := inB or isIn
+            if na(bTop) or math.abs(close - f.top) < math.abs(close - bTop)
+                bTop := f.top
+                bBtm := f.btm
+                bSc  := f.score
+                bIF  := f.state == 3
+        else
+            inS := inS or isIn
+            if na(sBtm) or math.abs(close - f.btm) < math.abs(close - sBtm)
+                sTop := f.top
+                sBtm := f.btm
+                sSc  := f.score
+                sIF  := f.state == 3
+    newInB = inB and not inB[1]
+    newInS = inS and not inS[1]
+    // 距離要在這裡用該檔自己的收盤價算（外層的 close 是圖表上那檔）。正值 = 還差幾 % 才碰到
+    bDist = na(bTop) ? na : (close - bTop) / close * 100
+    sDist = na(sBtm) ? na : (sBtm - close) / close * 100
+
+    [sigDir, sigRev, grade, bTop, bBtm, bSc, bIF, bDist, sTop, sBtm, sSc, sIF, sDist, inB, inS, newInB, newInS]
+
+// ═══════════════ 呈現層 ═══════════════
+f_zoneTxt(string side, float bt, float tp, float sc, bool isIF) =>
+    side + (isIF ? " IFVG " : " ") + f_tier(sc) + f_pct(sc) + " " + str.tostring(bt, format.mintick) + "–" + str.tostring(tp, format.mintick)
+
+// 每格回傳：文字、底色、文字色、排序鍵（訊號 < 在 FVG 裡 < 距離）、是否醒目
+f_cell(int sigDir, bool sigRev, int grade, bool inB, bool inS, float bTop, float bBtm, float bSc, bool bIF, float bDist, float sTop, float sBtm, float sSc, bool sIF, float sDist) =>
+    string txt = "–"
+    color  bg  = na
+    color  fg  = C_DIM
+    float  key = 1e9
+    bool   hot = false
+    gTxt = grade == 3 ? "A+" : grade == 2 ? "A" : "B"
+    if sigDir != 0
+        txt := (sigDir == 1 ? "多 " : "空 ") + (sigRev ? "REV " : "TRND ") + gTxt
+        bg  := sigDir == 1 ? C_BULL_SIG : C_BEAR_SIG
+        fg  := color.white
+        key := -2000. - grade
+        hot := true
+    else if inB
+        txt := f_zoneTxt("多", bBtm, bTop, bSc, bIF)
+        bg  := C_BULL_HIT
+        fg  := color.white
+        key := -1000. - bSc
+        hot := true
+    else if inS
+        txt := f_zoneTxt("空", sBtm, sTop, sSc, sIF)
+        bg  := C_BEAR_HIT
+        fg  := color.white
+        key := -1000. - sSc
+        hot := true
+    else
+        bullNear = not na(bDist) and bDist >= 0
+        bearNear = not na(sDist) and sDist >= 0
+        if bullNear and (not bearNear or bDist <= sDist)
+            key := bDist
+            txt := "多 ▼" + str.tostring(bDist, "#.0") + "% " + f_tier(bSc) + f_pct(bSc) + " " + str.tostring(bTop, format.mintick)
+            bg  := bDist <= nearPct ? C_BULL_NEAR : na
+            fg  := bDist <= nearPct ? C_BULL_TXT : C_DIM
+        else if bearNear
+            key := sDist
+            txt := "空 ▲" + str.tostring(sDist, "#.0") + "% " + f_tier(sSc) + f_pct(sSc) + " " + str.tostring(sBtm, format.mintick)
+            bg  := sDist <= nearPct ? C_BEAR_NEAR : na
+            fg  := sDist <= nearPct ? C_BEAR_TXT : C_DIM
+    [txt, bg, fg, key, hot]
+
+// ═══════════════ 主體 ═══════════════
+rawSym  = str.replace_all(str.replace_all(str.replace_all(symTxt, "\r", ","), "\n", ","), " ", ",")
+allSyms = str.split(rawSym, ",")
+syms    = array.new<string>()
+if array.size(allSyms) > 0
+    for k = 0 to array.size(allSyms) - 1
+        v = array.get(allSyms, k)
+        if str.length(v) > 0 and array.size(syms) < 40
+            array.push(syms, v)
+n = array.size(syms)
+
+colSym = array.new<string>()
+colTxt = array.new<string>()
+colBg  = array.new<color>()
+colFg  = array.new<color>()
+colHot = array.new<bool>()
+colKey = array.new<float>()
+msg    = ""
+
+for i = 0 to n - 1
+    sym = array.get(syms, i)
+    [sd, sr, gr, bTop, bBtm, bSc, bIF, bDist, sTop, sBtm, sSc, sIF, sDist, iB, iS, nB, nS] = request.security(sym, tf, fvgScan(),
+         ignore_invalid_symbol = true, calc_bars_count = i_calcBars)
+    [txt, bg, fg, key, hot] = f_cell(sd, sr, gr, iB, iS, bTop, bBtm, bSc, bIF, bDist, sTop, sBtm, sSc, sIF, sDist)
+
+    array.push(colSym, sym)
+    array.push(colTxt, txt)
+    array.push(colBg,  bg)
+    array.push(colFg,  fg)
+    array.push(colHot, hot)
+    array.push(colKey, key)
+
+    if i_alSig and sd != 0
+        msg := msg + sym + " [" + tf + "] " + (sd == 1 ? "多方 " : "空方 ") + (sr ? "REV " : "TRND ") +
+             (gr == 3 ? "A+" : gr == 2 ? "A" : "B") + "\n"
+    if i_alEnter and nB and bSc >= i_alMinScore
+        msg := msg + sym + " [" + tf + "] 進入多方 FVG " + f_tier(bSc) + f_pct(bSc) + " " +
+             str.tostring(bBtm, format.mintick) + "~" + str.tostring(bTop, format.mintick) + "\n"
+    if i_alEnter and nS and sSc >= i_alMinScore
+        msg := msg + sym + " [" + tf + "] 進入空方 FVG " + f_tier(sSc) + f_pct(sSc) + " " +
+             str.tostring(sBtm, format.mintick) + "~" + str.tostring(sTop, format.mintick) + "\n"
+
+// ═══════════════ 表格 ═══════════════
+// 每欄 perCol 檔，排滿換到右邊。每欄佔 3 個表格欄：代號、結果、與下一欄之間的間隔
+var table t = table.new(f_pos(), 24, 41, border_width = 0, frame_width = 1,
+     frame_color = C_LINE, border_color = C_LINE)
+
+if barstate.islast and n > 0
+    table.clear(t, 0, 0, 23, 40)
+    order  = array.sort_indices(colKey, order.ascending)
+    rows   = math.min(n, showRows)
+    groups = math.ceil(rows / perCol)
+
+    for g = 0 to groups - 1
+        c = g * 3
+        table.cell(t, c,     0, "代號", bgcolor = C_HEAD, text_color = C_HEADTXT, text_size = f_size(), text_halign = text.align_left)
+        table.cell(t, c + 1, 0, "FVG " + f_tfLabel(tf), bgcolor = C_HEAD, text_color = C_HEADTXT, text_size = f_size())
+        if g < groups - 1
+            table.cell(t, c + 2, 0, "", width = 0.5)
+
+    for r = 0 to rows - 1
+        i     = array.get(order, r)
+        hot   = array.get(colHot, i)
+        c     = math.floor(r / perCol) * 3
+        row   = r % perCol + 1
+        rowBg = hot ? C_ROW_HIT : (row % 2 == 1 ? C_ROW_A : C_ROW_B)
+
+        table.cell(t, c, row, array.get(colSym, i), bgcolor = rowBg,
+             text_color = hot ? color.white : C_SYMTXT, text_size = f_size(), text_halign = text.align_left)
+        table.cell(t, c + 1, row, array.get(colTxt, i),
+             bgcolor = na(array.get(colBg, i)) ? rowBg : array.get(colBg, i),
+             text_color = array.get(colFg, i), text_size = f_size())
+
+// ═══════════════ 單一 alert ═══════════════
+if barstate.isconfirmed and str.length(msg) > 0
+    alert(msg, alert.freq_once_per_bar_close)
