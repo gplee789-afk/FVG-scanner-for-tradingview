@@ -97,3 +97,17 @@
 - 原版預設的訊號條件很嚴（順勢要同時站上 EMA200、在折價區、確認 K 是強勢位移），30 分線上訊號可能很少，樣本不夠就看不出績效。
 - 策略測試器只用圖上載入的歷史，換股票、換週期、多跑幾檔再下結論。
 - 本專案僅供研究與學習，不構成任何投資建議。
+
+---
+
+## 授權
+
+兩支腳本的邏輯源自 GainzAlgo 發布於 TradingView 的開源腳本 "FVG with Probabilities"：
+https://www.tradingview.com/script/sSsrTFwp-FVG-with-Probabilities-GainzAlgo/
+
+本專案以 [Mozilla Public License 2.0](LICENSE)（MPL 2.0）釋出。使用、修改或再散布時：
+
+- 保留每個檔案開頭的授權聲明，並註明出處（本專案與 GainzAlgo 原作）。
+- 修改過的檔案仍須以 MPL 2.0 釋出，並公開原始碼。
+
+在 TradingView 上重新發布，另外要遵守 TradingView 的 [House Rules](https://www.tradingview.com/support/solutions/43000591638/)。完整條文以 [LICENSE](LICENSE) 為準。

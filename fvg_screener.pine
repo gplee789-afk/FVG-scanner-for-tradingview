@@ -1,4 +1,6 @@
 //@version=6
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// 邏輯源自 © GainzAlgo "FVG with Probabilities"（https://www.tradingview.com/script/sSsrTFwp-FVG-with-Probabilities-GainzAlgo/）
 // FVG 掃描器（台股）— 單週期 × 40 檔，單一 alert
 //
 // 版面與用法照 SMC OB 掃描器（https://github.com/gplee789-afk/SMC-ob-scanner-for-tradingview-v2 的 pine/smc_ob_screener.pine）；每檔的判斷用 fvg_prob_strategy.pine 的邏輯
